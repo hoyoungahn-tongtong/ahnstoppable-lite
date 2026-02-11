@@ -17,43 +17,38 @@ const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 export const db = getFirestore(app);
 
-// ✅ 한번만 실행되도록 promise 캐시
+// 익명 로그인 "완료"까지 기다리는 Promise
 let _authReadyPromise = null;
 
-/**
- * waitForAuthReady:
- * - 익명 로그인(signInAnonymously) 보장
- * - onAuthStateChanged로 auth 객체 준비/사용자 확보 완료까지 대기
- */
 export function waitForAuthReady() {
   if (_authReadyPromise) return _authReadyPromise;
 
-  _authReadyPromise = new Promise(async (resolve, reject) => {
-    try {
-      // 이미 로그인되어 있으면 즉시 resolve
-      if (auth.currentUser) {
-        resolve(auth.currentUser);
-        return;
-      }
-
-      // 익명 로그인 시도
-      await signInAnonymously(auth);
-
-      // 상태 안정화 대기
-      const unsub = onAuthStateChanged(
-        auth,
-        (user) => {
+  _authReadyPromise = new Promise((resolve, reject) => {
+    const unsub = onAuthStateChanged(
+      auth,
+      async (user) => {
+        try {
+          if (user) {
+            unsub();
+            resolve(user);
+            return;
+          }
+          // 아직 user가 없으면 익명 로그인 시도
+          await signInAnonymously(auth);
+          // signIn 후 onAuthStateChanged가 다시 호출되며 resolve됨
+        } catch (e) {
           unsub();
-          resolve(user);
-        },
-        (err) => {
-          reject(err);
+          reject(e);
         }
-      );
-    } catch (e) {
-      reject(e);
-    }
+      },
+      (err) => {
+        unsub();
+        reject(err);
+      }
+    );
   });
 
   return _authReadyPromise;
 }
+
+export default app;

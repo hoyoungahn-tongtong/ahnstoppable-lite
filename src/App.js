@@ -10,20 +10,10 @@ import {
   setDoc,
   addDoc,
   where,
+  updateDoc,
+  deleteDoc,
 } from "firebase/firestore";
 import { db, waitForAuthReady } from "./firebase";
-
-/**
- * ✅ UPDATED REQUESTS APPLIED
- * 1) Admin reply 실제 저장/표시되도록 수정 (reply doc도 같은 query로 잡히게 정리)
- * 2) 로그인한 학생/관리자만 질문 + UC 기록을 "볼 수 있게" UI 차단 (로그인 전엔 구독도 안 함)
- * 3) 수업시간 밖이어도 특정 날짜로 들어가면 학생도 로그 열람 가능:
- *    - 본인 글/탭: 본인 이름 표시
- *    - 다른 학생: 익명(Student 1, Student 2…)
- *    - 교수 글: "Professor’s reply"
- * 4) 수업시간 외에도 로그인 후 제출 가능(이미 허용) + Admin은 시간/이름 모두 확인 가능(이미 유지)
- * 5) Admin PIN 입력 시 화면에 숫자 노출 방지(type=password)
- */
 
 // =========================
 // ENV / CONFIG
@@ -31,7 +21,6 @@ import { db, waitForAuthReady } from "./firebase";
 const APP_ID = process.env.REACT_APP_APP_ID || "ahnstoppable-lite";
 const ADMIN_PIN = process.env.REACT_APP_ADMIN_PIN || "";
 const ADMIN_NAME = "Administrator";
-const APP_VERSION = "2026-02-10-secureLogs-replyFix-v2";
 
 const COURSES = [
   { id: "ADV 375-01", label: "ADV 375-01" },
@@ -119,25 +108,19 @@ function getPacificParts(now = new Date()) {
     hour: "2-digit",
     minute: "2-digit",
   });
-
   const parts = dtf.formatToParts(now);
   const map = {};
-  for (const p of parts) {
-    if (p.type !== "literal") map[p.type] = p.value;
-  }
+  for (const p of parts) if (p.type !== "literal") map[p.type] = p.value;
 
   const weekdayMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
-
   const year = Number(map.year);
   const month = Number(map.month);
   const day = Number(map.day);
   const hour = Number(map.hour);
   const minute = Number(map.minute);
   const dow = weekdayMap[map.weekday] ?? 0;
-
   const dateKey = `${map.year}-${map.month}-${map.day}`;
   const mins = hour * 60 + minute;
-
   return { year, month, day, hour, minute, dow, mins, dateKey };
 }
 
@@ -145,18 +128,17 @@ function getPacificDateKeyNow() {
   return getPacificParts(new Date()).dateKey;
 }
 
-function formatTsPT(tsLike) {
-  if (!tsLike) return "";
-  const ms =
-    typeof tsLike.toMillis === "function"
-      ? tsLike.toMillis()
-      : typeof tsLike.seconds === "number"
-      ? tsLike.seconds * 1000
-      : null;
+function tsToMillis(tsLike) {
+  if (!tsLike) return null;
+  if (typeof tsLike.toMillis === "function") return tsLike.toMillis();
+  if (typeof tsLike.seconds === "number") return tsLike.seconds * 1000;
+  return null;
+}
 
+function formatTsPT(tsLike) {
+  const ms = tsToMillis(tsLike);
   if (!ms) return "";
   const d = new Date(ms);
-
   return new Intl.DateTimeFormat("en-US", {
     timeZone: "America/Los_Angeles",
     year: "numeric",
@@ -168,9 +150,26 @@ function formatTsPT(tsLike) {
   }).format(d);
 }
 
+function toPTMinutes(tsLike) {
+  const ms = tsToMillis(tsLike);
+  if (!ms) return null;
+  const d = new Date(ms);
+  const parts = getPacificParts(d);
+  return parts.mins;
+}
+
 function clampText(s, max = 1200) {
   const t = String(s ?? "");
   return t.length > max ? t.slice(0, max) : t;
+}
+
+function minsToLabel(mins) {
+  if (mins == null) return "";
+  const h24 = Math.floor(mins / 60);
+  const m = mins % 60;
+  const ampm = h24 >= 12 ? "PM" : "AM";
+  const h12 = ((h24 + 11) % 12) + 1;
+  return `${h12}:${String(m).padStart(2, "0")} ${ampm}`;
 }
 
 // =========================
@@ -271,14 +270,7 @@ function Calendar2026({ valueDateKey, onPick, onClose }) {
 // =========================
 // Student PIN Auth UI
 // =========================
-function StudentPinAuth({
-  selectedName,
-  pinRegistered,
-  authBusy,
-  onLogin,
-  onRegister,
-  isAuthed,
-}) {
+function StudentPinAuth({ selectedName, pinRegistered, authBusy, onLogin, onRegister, isAuthed }) {
   const [pin, setPin] = useState("");
   const [pin2, setPin2] = useState("");
 
@@ -289,9 +281,7 @@ function StudentPinAuth({
 
   if (isAuthed) return null;
 
-  if (!selectedName) {
-    return <div style={{ opacity: 0.8, marginTop: 12 }}>Select a name first.</div>;
-  }
+  if (!selectedName) return <div style={{ opacity: 0.8, marginTop: 12 }}>Select your name first.</div>;
 
   if (pinRegistered) {
     return (
@@ -306,7 +296,6 @@ function StudentPinAuth({
           inputMode="numeric"
           maxLength={4}
           type="password"
-          autoComplete="off"
         />
 
         <button
@@ -333,7 +322,6 @@ function StudentPinAuth({
         inputMode="numeric"
         maxLength={4}
         type="password"
-        autoComplete="off"
       />
       <input
         style={styles.pinInput}
@@ -343,7 +331,6 @@ function StudentPinAuth({
         inputMode="numeric"
         maxLength={4}
         type="password"
-        autoComplete="off"
       />
 
       <button
@@ -358,37 +345,31 @@ function StudentPinAuth({
 }
 
 // =========================
-// Understanding Check UI
+// Understanding Check UI (가로 정렬 + 이모지)
 // =========================
-function TrafficLight({ disabled, onTap }) {
+function TrafficLightRow({ disabled, onTap }) {
+  const items = [
+    { key: "red", emoji: "😟", label: "Lost", bg: "#e74c3c" },
+    { key: "yellow", emoji: "🤔", label: "So-so", bg: "#f1c40f" },
+    { key: "green", emoji: "✅", label: "Got it", bg: "#2ecc71" },
+  ];
+
   return (
-    <div style={styles.trafficShell}>
-      <button
-        disabled={disabled}
-        onClick={() => onTap("red")}
-        style={{ ...styles.lightBtn, ...(disabled ? styles.btnDisabled : {}) }}
-        title="Red"
-      >
-        <div style={{ ...styles.lightCircle, background: "#e74c3c" }} />
-      </button>
-
-      <button
-        disabled={disabled}
-        onClick={() => onTap("yellow")}
-        style={{ ...styles.lightBtn, ...(disabled ? styles.btnDisabled : {}) }}
-        title="Yellow"
-      >
-        <div style={{ ...styles.lightCircle, background: "#f1c40f" }} />
-      </button>
-
-      <button
-        disabled={disabled}
-        onClick={() => onTap("green")}
-        style={{ ...styles.lightBtn, ...(disabled ? styles.btnDisabled : {}) }}
-        title="Green"
-      >
-        <div style={{ ...styles.lightCircle, background: "#2ecc71" }} />
-      </button>
+    <div style={styles.trafficRow}>
+      {items.map((it) => (
+        <button
+          key={it.key}
+          disabled={disabled}
+          onClick={() => onTap(it.key)}
+          style={{ ...styles.trafficBtn, ...(disabled ? styles.btnDisabled : {}) }}
+          title={it.label}
+        >
+          <div style={{ ...styles.trafficCircle, background: it.bg }}>
+            <div style={styles.trafficEmoji}>{it.emoji}</div>
+          </div>
+          <div style={styles.trafficLabel}>{it.label}</div>
+        </button>
+      ))}
     </div>
   );
 }
@@ -397,7 +378,7 @@ function TrafficLight({ disabled, onTap }) {
 // MAIN APP
 // =========================
 export default function App() {
-  // UI state
+  // Pre-login selections
   const [selectedCourse, setSelectedCourse] = useState("ADV 375-01");
   const [selectedDateKey, setSelectedDateKey] = useState(getPacificDateKeyNow());
   const [calendarOpen, setCalendarOpen] = useState(false);
@@ -406,6 +387,7 @@ export default function App() {
   const [adminMode, setAdminMode] = useState(false);
   const [adminGatePin, setAdminGatePin] = useState("");
   const [adminAuthed, setAdminAuthed] = useState(false);
+  const [showAdminPin, setShowAdminPin] = useState(false);
 
   // Admin projection controls
   const [hideNames, setHideNames] = useState(true);
@@ -424,7 +406,8 @@ export default function App() {
 
   // Data
   const [questions, setQuestions] = useState([]);
-  const [ucTaps, setUcTaps] = useState([]);
+  const [ucSummary, setUcSummary] = useState([]); // 1 student -> current color doc
+  const [ucEvents, setUcEvents] = useState([]); // history events (admin view)
 
   // Inputs
   const [questionText, setQuestionText] = useState("");
@@ -433,60 +416,59 @@ export default function App() {
   const [replyTarget, setReplyTarget] = useState(null); // { id, actor }
   const [adminReplyText, setAdminReplyText] = useState("");
 
+  // Student edit UI
+  const [editTargetId, setEditTargetId] = useState(null);
+  const [editText, setEditText] = useState("");
+
+  // Class session window (Admin set)
+  const [classSession, setClassSession] = useState(null); // {startMins,endMins}
+
   // time tick
   const [nowTick, setNowTick] = useState(0);
   useEffect(() => {
     const id = setInterval(() => setNowTick((x) => x + 1), 20 * 1000);
     return () => clearInterval(id);
   }, []);
-  const [ptNow, setPtNow] = useState(() => getPacificParts(new Date()));
-  useEffect(() => {
-    setPtNow(getPacificParts(new Date()));
-  }, [nowTick]);
+  useEffect(() => void nowTick, [nowTick]);
 
   // localStorage keys
   const studentAuthKey = useMemo(
     () => `auth:${APP_ID}:${selectedCourse}:student:${studentName}`,
     [selectedCourse, studentName]
   );
-  const adminAuthKey = useMemo(
-    () => `auth:${APP_ID}:${selectedCourse}:admin:${ADMIN_NAME}`,
-    [selectedCourse]
-  );
+  const adminAuthKey = useMemo(() => `auth:${APP_ID}:${selectedCourse}:admin:${ADMIN_NAME}`, [
+    selectedCourse,
+  ]);
 
-  // ✅ viewer gate (요청 #2: 로그인한 학생+admin만 기록 열람)
-  const logViewerAuthed = studentAuthed || adminAuthed;
+  // ============================
+  // (4) 미래 날짜 제출 방지
+  // ============================
+  const todayPTKey = getPacificDateKeyNow();
+  const isFutureDate = selectedDateKey > todayPTKey;
 
-  // ✅ students can submit ANYTIME (요청 #4)
-  const studentCanSubmit = studentAuthed;
-  const adminCanSubmit = adminAuthed;
-
-  // =========================
-  // Firebase init (anonymous auth 준비)
-  // =========================
+  // ============================================
+  // 1) Auth Ready init
+  // ============================================
   useEffect(() => {
     let mounted = true;
-
-    const init = async () => {
+    (async () => {
       try {
         await waitForAuthReady();
         if (!mounted) return;
         setAuthReady(true);
       } catch (e) {
         console.error(e);
-        alert("Firebase auth failed. Check firebase config (.env) and authorized domains.");
+        alert("Firebase auth failed. Check .env values and Firebase project settings.");
       }
-    };
-
-    init();
+    })();
     return () => {
       mounted = false;
     };
   }, []);
 
-  // -------------------------
-  // Load auth flags from localStorage
-  // -------------------------
+  // ============================================
+  // 2) Restore auth flags
+  // ============================================
   useEffect(() => {
     if (!studentName) {
       setStudentAuthed(false);
@@ -499,9 +481,9 @@ export default function App() {
     setAdminAuthed(localStorage.getItem(adminAuthKey) === "true");
   }, [adminAuthKey]);
 
-  // -------------------------
-  // Check if student PIN exists
-  // -------------------------
+  // ============================================
+  // 3) Student PIN exists?
+  // ============================================
   const checkStudentPinRegistered = useCallback(
     async (name) => {
       if (!authReady || !name) return false;
@@ -522,7 +504,6 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
-
     (async () => {
       if (!authReady) return;
 
@@ -544,9 +525,9 @@ export default function App() {
     };
   }, [authReady, selectedCourse, studentName, checkStudentPinRegistered]);
 
-  // -------------------------
-  // Student PIN handlers
-  // -------------------------
+  // ============================================
+  // 4) Student PIN handlers
+  // ============================================
   const studentLoginWithPin = useCallback(
     async (name, pin) => {
       if (!authReady) return;
@@ -625,18 +606,13 @@ export default function App() {
     setStudentAuthed(false);
   }, [studentAuthKey, studentName]);
 
-  // -------------------------
-  // Admin gate
-  // -------------------------
+  // ============================================
+  // 5) Admin gate (PIN 마스킹)
+  // ============================================
   const adminLogin = useCallback(() => {
-    if (!ADMIN_PIN) {
-      alert("Missing REACT_APP_ADMIN_PIN in .env");
-      return;
-    }
-    if (adminGatePin !== ADMIN_PIN) {
-      alert("Wrong admin PIN");
-      return;
-    }
+    if (!ADMIN_PIN) return alert("Missing REACT_APP_ADMIN_PIN in .env");
+    if (adminGatePin !== ADMIN_PIN) return alert("Wrong admin PIN");
+
     setAdminAuthed(true);
     localStorage.setItem(adminAuthKey, "true");
     setAdminGatePin("");
@@ -647,16 +623,87 @@ export default function App() {
     setAdminAuthed(false);
   }, [adminAuthKey]);
 
-  // -------------------------
-  // ✅ Firestore: subscribe logs
-  // 요청 #2: 로그인한 사용자만 "볼 수 있게" + (중요) 로그인 전에는 구독 자체를 하지 않음
-  // -------------------------
+  // ============================================
+  // 6) Visibility rules
+  // ============================================
+  const logViewerAuthed = studentAuthed || adminAuthed;
+
+  // 제출 가능 조건 (4번: 미래 날짜는 제출 불가)
+  const studentCanSubmit = studentAuthed && !isFutureDate;
+  const adminCanSubmit = adminAuthed && !isFutureDate;
+
+  // ============================================
+  // 7) Class session window doc (Admin만 구독)
+  // ============================================
+  useEffect(() => {
+    if (!authReady) return;
+    if (!adminAuthed) {
+      setClassSession(null);
+      return;
+    }
+
+    const sessionId = `${APP_ID}_${selectedCourse}_${selectedDateKey}`;
+    const ref = doc(db, "lite_class_sessions", sessionId);
+
+    const unsub = onSnapshot(
+      ref,
+      (snap) => {
+        if (!snap.exists()) {
+          setClassSession(null);
+          return;
+        }
+        setClassSession(snap.data());
+      },
+      (err) => console.error(err)
+    );
+
+    return () => unsub();
+  }, [authReady, adminAuthed, selectedCourse, selectedDateKey]);
+
+  const setSessionStartNow = useCallback(async () => {
+    if (!adminAuthed) return alert("Admin login required.");
+    const sessionId = `${APP_ID}_${selectedCourse}_${selectedDateKey}`;
+    const ref = doc(db, "lite_class_sessions", sessionId);
+    const now = getPacificParts(new Date());
+    await setDoc(
+      ref,
+      { appId: APP_ID, course: selectedCourse, dateKey: selectedDateKey, startMins: now.mins, updatedAt: serverTimestamp() },
+      { merge: true }
+    );
+  }, [adminAuthed, selectedCourse, selectedDateKey]);
+
+  const setSessionEndNow = useCallback(async () => {
+    if (!adminAuthed) return alert("Admin login required.");
+    const sessionId = `${APP_ID}_${selectedCourse}_${selectedDateKey}`;
+    const ref = doc(db, "lite_class_sessions", sessionId);
+    const now = getPacificParts(new Date());
+    await setDoc(
+      ref,
+      { appId: APP_ID, course: selectedCourse, dateKey: selectedDateKey, endMins: now.mins, updatedAt: serverTimestamp() },
+      { merge: true }
+    );
+  }, [adminAuthed, selectedCourse, selectedDateKey]);
+
+  const clearSessionWindow = useCallback(async () => {
+    if (!adminAuthed) return alert("Admin login required.");
+    const sessionId = `${APP_ID}_${selectedCourse}_${selectedDateKey}`;
+    const ref = doc(db, "lite_class_sessions", sessionId);
+    await setDoc(
+      ref,
+      { appId: APP_ID, course: selectedCourse, dateKey: selectedDateKey, startMins: null, endMins: null, updatedAt: serverTimestamp() },
+      { merge: true }
+    );
+  }, [adminAuthed, selectedCourse, selectedDateKey]);
+
+  // ============================================
+  // 8) Firestore subscribe (로그인한 사람만!)
+  // ============================================
   useEffect(() => {
     if (!authReady) return;
     if (!logViewerAuthed) {
-      // 로그인 풀리면 데이터도 화면에서 사라지게
       setQuestions([]);
-      setUcTaps([]);
+      setUcSummary([]);
+      setUcEvents([]);
       return;
     }
 
@@ -667,7 +714,7 @@ export default function App() {
       where("dateKey", "==", selectedDateKey)
     );
 
-    const qUc = query(
+    const qUcSummary = query(
       collection(db, "lite_understanding"),
       where("appId", "==", APP_ID),
       where("course", "==", selectedCourse),
@@ -685,121 +732,149 @@ export default function App() {
     );
 
     const unsub2 = onSnapshot(
-      qUc,
+      qUcSummary,
       (snap) => {
         const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-        arr.sort((a, b) => (a.createdAt?.seconds ?? 0) - (b.createdAt?.seconds ?? 0));
-        setUcTaps(arr);
+        arr.sort((a, b) => (a.updatedAt?.seconds ?? 0) - (b.updatedAt?.seconds ?? 0));
+        setUcSummary(arr);
       },
       (err) => console.error(err)
     );
 
+    // ✅ (1) 히스토리 이벤트는 Admin이 "Show Tap Log"를 켰을 때만 구독
+    let unsub3 = null;
+    if (adminAuthed && showUnderstandingLog) {
+      const qEvents = query(
+        collection(db, "lite_understanding_events"),
+        where("appId", "==", APP_ID),
+        where("course", "==", selectedCourse),
+        where("dateKey", "==", selectedDateKey)
+      );
+      unsub3 = onSnapshot(
+        qEvents,
+        (snap) => {
+          const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+          arr.sort((a, b) => (a.at?.seconds ?? 0) - (b.at?.seconds ?? 0));
+          setUcEvents(arr);
+        },
+        (err) => console.error(err)
+      );
+    } else {
+      setUcEvents([]);
+    }
+
     return () => {
       unsub1();
       unsub2();
+      if (unsub3) unsub3();
     };
-  }, [authReady, logViewerAuthed, selectedCourse, selectedDateKey]);
+  }, [authReady, logViewerAuthed, selectedCourse, selectedDateKey, adminAuthed, showUnderstandingLog]);
 
-  // -------------------------
-  // Anonymous mapping
-  // - Admin: hideNames 옵션으로 익명 처리
-  // - Student view: 본인만 실명 / 타인은 익명 Student 1,2...
-  // -------------------------
-  const studentAnonMap = useMemo(() => {
+  // ============================================
+  // 9) Anonymous mapping (Admin용)
+  // ============================================
+  const anonNameMap = useMemo(() => {
     const names = new Set();
     for (const q of questions) if (q.role === "student" && q.actor) names.add(q.actor);
-    for (const t of ucTaps) if (t.role === "student" && t.actor) names.add(t.actor);
-
-    // 본인 제외하고 익명 번호 부여
-    const sorted = Array.from(names)
-      .filter((n) => n && n !== studentName)
-      .sort((a, b) => String(a).localeCompare(String(b)));
-
-    const map = {};
-    sorted.forEach((n, i) => {
-      map[n] = `Student ${i + 1}`;
-    });
-    return map;
-  }, [questions, ucTaps, studentName]);
-
-  const adminAnonMap = useMemo(() => {
-    const names = new Set();
-    for (const q of questions) if (q.role === "student" && q.actor) names.add(q.actor);
-    for (const t of ucTaps) if (t.role === "student" && t.actor) names.add(t.actor);
+    for (const t of ucSummary) if (t.role === "student" && t.actor) names.add(t.actor);
 
     const sorted = Array.from(names).sort((a, b) => String(a).localeCompare(String(b)));
     const map = {};
-    sorted.forEach((n, i) => {
-      map[n] = `Student ${i + 1}`;
-    });
+    sorted.forEach((n, i) => (map[n] = `Student ${i + 1}`));
     return map;
-  }, [questions, ucTaps]);
+  }, [questions, ucSummary]);
 
   const displayActor = useCallback(
     (actor, role) => {
-      if (role === "admin") {
-        // 학생 화면에서는 교수 답변 라벨로 보이게 (요청 #3)
-        return adminAuthed ? "Admin" : "Professor’s reply";
+      if (!adminAuthed) {
+        if (role === "admin") return "Professor’s reply";
+        if (role === "student") {
+          if (actor && actor === studentName) return "You";
+          return "Anonymous";
+        }
+        return "Anonymous";
       }
-
-      // student role
+      if (role === "admin") return "Professor";
       if (!actor) return "Student";
-
-      // Admin 화면
-      if (adminAuthed) {
-        if (hideNames) return adminAnonMap[actor] || "Student";
-        return actor;
-      }
-
-      // Student 화면
-      if (studentAuthed && actor === studentName) return actor; // 본인만 실명
-      return studentAnonMap[actor] || "Student";
+      if (hideNames) return anonNameMap[actor] || "Student";
+      return actor;
     },
-    [adminAuthed, hideNames, adminAnonMap, studentAuthed, studentName, studentAnonMap]
+    [adminAuthed, hideNames, anonNameMap, studentName]
   );
 
-  // -------------------------
-  // Submit actions (요청 #4 이미 허용 유지)
-  // -------------------------
+  // ============================================
+  // (1) Understanding: Summary + Event history
+  // ============================================
   const submitUnderstanding = useCallback(
     async (color) => {
       if (!logViewerAuthed) return alert("Please login first.");
-      if (!studentCanSubmit && !adminCanSubmit) return;
       if (!authReady) return;
+      if (isFutureDate) return alert("Future class dates: submissions are disabled.");
 
       const actor = adminCanSubmit ? ADMIN_NAME : studentName;
       const role = adminCanSubmit ? "admin" : "student";
+      if (!actor) return alert("Select your name first.");
+
+      // ✅ summary doc: 1인 1표(현재 상태)
+      const tapId = `tap_${APP_ID}_${selectedCourse}_${selectedDateKey}_${actor}`;
+      const summaryRef = doc(db, "lite_understanding", tapId);
 
       try {
-        await addDoc(collection(db, "lite_understanding"), {
+        // 이전 색 가져와서 이벤트에 fromColor 기록
+        let prevColor = null;
+        const prevSnap = await getDoc(summaryRef);
+        if (prevSnap.exists()) prevColor = prevSnap.data()?.color ?? null;
+
+        await setDoc(
+          summaryRef,
+          {
+            appId: APP_ID,
+            course: selectedCourse,
+            dateKey: selectedDateKey,
+            color,
+            actor,
+            role,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          },
+          { merge: true }
+        );
+
+        // ✅ history event: 누를 때마다 addDoc (변경 히스토리)
+        await addDoc(collection(db, "lite_understanding_events"), {
           appId: APP_ID,
           course: selectedCourse,
           dateKey: selectedDateKey,
-          color,
           actor,
           role,
-          createdAt: serverTimestamp(),
+          fromColor: prevColor,
+          toColor: color,
+          at: serverTimestamp(),
         });
       } catch (e) {
         console.error(e);
-        alert(`Failed to submit. ${e?.code || ""}`);
+        alert("Failed to submit understanding check. (Rules/config?)");
       }
     },
     [
       authReady,
       logViewerAuthed,
-      studentCanSubmit,
       adminCanSubmit,
       studentName,
       selectedCourse,
       selectedDateKey,
+      isFutureDate,
     ]
   );
 
+  // ============================================
+  // Submit Question / Admin Reply
+  // ============================================
   const submitQuestion = useCallback(async () => {
     if (!logViewerAuthed) return alert("Please login first.");
     if (!questionText.trim()) return;
     if (!authReady) return;
+    if (isFutureDate) return alert("Future class dates: submissions are disabled.");
 
     const can = studentCanSubmit || adminCanSubmit;
     if (!can) return;
@@ -821,7 +896,7 @@ export default function App() {
       setQuestionText("");
     } catch (e) {
       console.error(e);
-      alert(`Failed to post. ${e?.code || ""}`);
+      alert("Failed to post. (Rules/config?)");
     }
   }, [
     authReady,
@@ -832,16 +907,15 @@ export default function App() {
     studentName,
     selectedCourse,
     selectedDateKey,
+    isFutureDate,
   ]);
 
-  // ✅ (요청 #1) Admin reply 저장이 안 되던 케이스를 방지:
-  // - adminAuthed + authReady + replyTarget.id 체크
-  // - addDoc 성공하면 UI 초기화
   const submitAdminReply = useCallback(async () => {
     if (!adminAuthed) return alert("Admin login required.");
     if (!replyTarget?.id) return;
     if (!adminReplyText.trim()) return;
     if (!authReady) return;
+    if (isFutureDate) return alert("Future class dates: submissions are disabled.");
 
     try {
       await addDoc(collection(db, "lite_questions"), {
@@ -854,291 +928,482 @@ export default function App() {
         replyToId: replyTarget.id,
         createdAt: serverTimestamp(),
       });
-
-      // ✅ 성공 시 UI 정리
       setAdminReplyText("");
       setReplyTarget(null);
     } catch (e) {
       console.error(e);
-      alert(`Failed to reply. ${e?.code || ""}`);
+      alert("Reply failed. (Firestore rules / config?)");
     }
-  }, [authReady, adminAuthed, adminReplyText, replyTarget, selectedCourse, selectedDateKey]);
+  }, [authReady, adminAuthed, adminReplyText, replyTarget, selectedCourse, selectedDateKey, isFutureDate]);
 
-  // -------------------------
-  // Understanding counts + rate
-  // -------------------------
+  // ============================================
+  // (2) 학생 글 수정/삭제
+  // ============================================
+  const beginEdit = useCallback((q) => {
+    setEditTargetId(q.id);
+    setEditText(q.text || "");
+  }, []);
+
+  const cancelEdit = useCallback(() => {
+    setEditTargetId(null);
+    setEditText("");
+  }, []);
+
+  const saveEdit = useCallback(async () => {
+    if (!editTargetId) return;
+    if (!studentAuthed) return alert("Student login required.");
+    const newText = clampText(editText.trim());
+    if (!newText) return alert("Text cannot be empty.");
+
+    try {
+      await updateDoc(doc(db, "lite_questions", editTargetId), {
+        text: newText,
+        editedAt: serverTimestamp(),
+      });
+      cancelEdit();
+    } catch (e) {
+      console.error(e);
+      alert("Edit failed. (Rules/config?)");
+    }
+  }, [editTargetId, editText, studentAuthed, cancelEdit]);
+
+  const deleteMyPost = useCallback(async (q) => {
+    if (!studentAuthed) return alert("Student login required.");
+    const ok = window.confirm("Delete this post?");
+    if (!ok) return;
+
+    try {
+      await deleteDoc(doc(db, "lite_questions", q.id));
+    } catch (e) {
+      console.error(e);
+      alert("Delete failed. (Rules/config?)");
+    }
+  }, [studentAuthed]);
+
+  // ============================================
+  // Counts + Missing list (summary 기준이라 안정적)
+  // ============================================
   const ucCounts = useMemo(() => {
     const c = { red: 0, yellow: 0, green: 0 };
-    for (const t of ucTaps) {
+    for (const t of ucSummary) {
       if (t.color === "red") c.red++;
       if (t.color === "yellow") c.yellow++;
       if (t.color === "green") c.green++;
     }
     return c;
-  }, [ucTaps]);
+  }, [ucSummary]);
 
   const ucTotal = ucCounts.red + ucCounts.yellow + ucCounts.green;
-  const ucRate = useMemo(() => {
-    if (!ucTotal) return { red: 0, yellow: 0, green: 0 };
-    return {
-      red: Math.round((ucCounts.red / ucTotal) * 100),
-      yellow: Math.round((ucCounts.yellow / ucTotal) * 100),
-      green: Math.round((ucCounts.green / ucTotal) * 100),
-    };
-  }, [ucCounts, ucTotal]);
 
-  // Admin per-student breakdown
-  const perStudentCounts = useMemo(() => {
-    const map = {};
-    for (const t of ucTaps) {
-      const k = t.actor || "Unknown";
-      if (!map[k]) map[k] = { red: 0, yellow: 0, green: 0 };
-      if (t.color === "red") map[k].red++;
-      if (t.color === "yellow") map[k].yellow++;
-      if (t.color === "green") map[k].green++;
+  const tappedStudentSet = useMemo(() => {
+    const s = new Set();
+    for (const t of ucSummary) {
+      if (t.role === "student" && t.actor) s.add(t.actor);
     }
-    return map;
-  }, [ucTaps]);
+    return s;
+  }, [ucSummary]);
 
-  // -------------------------
-  // Threaded display for questions
-  // -------------------------
+  const missingStudents = useMemo(() => {
+    const roster = COURSE_STUDENTS[selectedCourse] || [];
+    return roster.filter((n) => n && !tappedStudentSet.has(n));
+  }, [selectedCourse, tappedStudentSet]);
+
+  // ============================================
+  // Threaded questions
+  // ============================================
   const threads = useMemo(() => {
     const roots = [];
     const repliesByParent = {};
-
     for (const q of questions) {
       const parentId = q.replyToId || null;
-      if (!parentId) {
-        roots.push(q);
-      } else {
+      if (!parentId) roots.push(q);
+      else {
         if (!repliesByParent[parentId]) repliesByParent[parentId] = [];
         repliesByParent[parentId].push(q);
       }
     }
-
     for (const k of Object.keys(repliesByParent)) {
       repliesByParent[k].sort((a, b) => (a.createdAt?.seconds ?? 0) - (b.createdAt?.seconds ?? 0));
     }
-
     return { roots, repliesByParent };
   }, [questions]);
 
-  // -------------------------
-  // ✅ 로그인 전에는 "기록 관련 섹션 자체"를 숨김 (요청 #2)
-  // -------------------------
-  const gatedMessage = (
-    <div style={{ opacity: 0.85, marginTop: 10 }}>
-      Login required to view logs.
-    </div>
+  // ============================================
+  // (5) Out-of-class activity (Admin)
+  // ============================================
+  const sessionStart = classSession?.startMins ?? null;
+  const sessionEnd = classSession?.endMins ?? null;
+  const hasSessionWindow = sessionStart != null && sessionEnd != null && sessionEnd >= sessionStart;
+
+  const isOutOfClass = useCallback(
+    (tsLike) => {
+      if (!hasSessionWindow) return false;
+      const m = toPTMinutes(tsLike);
+      if (m == null) return false;
+      return m < sessionStart || m > sessionEnd;
+    },
+    [hasSessionWindow, sessionStart, sessionEnd]
   );
+
+  const outOfClassPosts = useMemo(() => {
+    if (!adminAuthed || !hasSessionWindow) return [];
+    return questions
+      .filter((q) => isOutOfClass(q.createdAt))
+      .sort((a, b) => (a.createdAt?.seconds ?? 0) - (b.createdAt?.seconds ?? 0));
+  }, [adminAuthed, hasSessionWindow, questions, isOutOfClass]);
+
+  const outOfClassUCEvents = useMemo(() => {
+    if (!adminAuthed || !hasSessionWindow) return [];
+    return ucEvents
+      .filter((e) => isOutOfClass(e.at))
+      .sort((a, b) => (a.at?.seconds ?? 0) - (b.at?.seconds ?? 0));
+  }, [adminAuthed, hasSessionWindow, ucEvents, isOutOfClass]);
+
+  // ============================================
+  // UI Flow
+  // ============================================
+  const isLoggedIn = logViewerAuthed;
 
   return (
     <div style={styles.page}>
       <div style={styles.container}>
-        <div style={styles.title}>"Ahn"stoppable Learning:</div>
-        <div style={styles.subtitle}>
-          Freely Ask, Freely Learn <span style={{ opacity: 0.9 }}>(Lite)</span>
-        </div>
+        {/* (3) 색상/폰트 */}
+        <div style={styles.titleOrange}>"Ahn"stoppable Learning:</div>
+        <div style={styles.subtitleGreen}>Freely Ask, Freely Learn</div>
 
-        <div style={{ opacity: 0.6, fontSize: 12, marginBottom: 6 }}>
-          {APP_VERSION} · PT now: {ptNow.dateKey}{" "}
-          {String(ptNow.hour).padStart(2, "0")}:{String(ptNow.minute).padStart(2, "0")} ·{" "}
-          Auth: {authReady ? "ready" : "starting..."}
-        </div>
-
-        {/* Course */}
-        <div style={styles.card}>
-          <div style={styles.sectionTitle}>Course</div>
-          <select
-            style={styles.select}
-            value={selectedCourse}
-            onChange={(e) => setSelectedCourse(e.target.value)}
-          >
-            {COURSES.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.label}
-              </option>
-            ))}
-          </select>
-        </div>
-
-        {/* View Logs for Date */}
-        <div style={styles.card}>
-          <div style={styles.sectionTitle}>View Logs for Date</div>
-
-          <button style={styles.dateBtn} onClick={() => setCalendarOpen(true)}>
-            {selectedDateKey} ▼
-          </button>
-
-          {calendarOpen && (
-            <Calendar2026
-              valueDateKey={selectedDateKey}
-              onPick={(dk) => {
-                setSelectedDateKey(dk);
-                setCalendarOpen(false);
-              }}
-              onClose={() => setCalendarOpen(false)}
-            />
-          )}
-
-          {/* ✅ 로그인 전 안내 */}
-          {!logViewerAuthed && gatedMessage}
-        </div>
-
-        {/* Student Login */}
-        <div style={styles.card}>
-          <div style={styles.sectionTitle}>Student Login</div>
-
-          {!authReady && (
-            <div style={{ opacity: 0.85, marginTop: 10 }}>
-              Connecting to Firebase... (please wait)
+        {/* PRE-LOGIN */}
+        {!isLoggedIn && (
+          <>
+            <div style={styles.card}>
+              <div style={styles.sectionTitle}>Course</div>
+              <select
+                style={styles.select}
+                value={selectedCourse}
+                onChange={(e) => setSelectedCourse(e.target.value)}
+                disabled={!authReady}
+              >
+                {COURSES.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.label}
+                  </option>
+                ))}
+              </select>
             </div>
-          )}
 
-          <div style={{ marginTop: 10 }}>
-            <div style={{ opacity: 0.85, marginBottom: 8 }}>Select your name</div>
-            <select
-              style={styles.select}
-              value={studentName}
-              onChange={(e) => setStudentName(e.target.value)}
-              disabled={!authReady}
-            >
-              <option value="">-- Select --</option>
-              {(COURSE_STUDENTS[selectedCourse] || []).map((n) => (
-                <option key={n} value={n}>
-                  {n}
-                </option>
-              ))}
-            </select>
-          </div>
+            <div style={styles.card}>
+              <div style={styles.sectionTitle}>View Logs for Date</div>
+              <button
+                style={styles.dateBtn}
+                onClick={() => setCalendarOpen(true)}
+                disabled={!authReady}
+              >
+                {selectedDateKey} ▼
+              </button>
+              {calendarOpen && (
+                <Calendar2026
+                  valueDateKey={selectedDateKey}
+                  onPick={(dk) => {
+                    setSelectedDateKey(dk);
+                    setCalendarOpen(false);
+                  }}
+                  onClose={() => setCalendarOpen(false)}
+                />
+              )}
+              {isFutureDate && (
+                <div style={{ marginTop: 10, color: "#fbbf24", fontWeight: 900 }}>
+                  Future date selected. Submissions are disabled.
+                </div>
+              )}
+            </div>
 
-          <StudentPinAuth
-            selectedName={studentName}
-            pinRegistered={studentPinRegistered}
-            authBusy={authBusy}
-            isAuthed={studentAuthed}
-            onLogin={(pin) => studentLoginWithPin(studentName, pin)}
-            onRegister={(p1, p2) => studentRegisterWithPin(studentName, p1, p2)}
-          />
+            <div style={styles.card}>
+              <div style={styles.sectionTitle}>Student Login</div>
 
-          {studentAuthed && studentName && (
-            <div style={{ marginTop: 14, textAlign: "center" }}>
-              <div style={{ color: "#9ae6b4", fontWeight: 900, fontSize: 20 }}>
-                Logged in as {studentName}
+              {!authReady && (
+                <div style={{ opacity: 0.85, marginTop: 10 }}>
+                  Connecting to Firebase... (please wait)
+                </div>
+              )}
+
+              <div style={{ marginTop: 10 }}>
+                <div style={{ opacity: 0.85, marginBottom: 8 }}>Select your name</div>
+                <select
+                  style={styles.select}
+                  value={studentName}
+                  onChange={(e) => setStudentName(e.target.value)}
+                  disabled={!authReady}
+                >
+                  <option value="">-- Select --</option>
+                  {(COURSE_STUDENTS[selectedCourse] || []).map((n) => (
+                    <option key={n} value={n}>
+                      {n}
+                    </option>
+                  ))}
+                </select>
               </div>
-              <button style={styles.smallBtn2} onClick={logoutStudent}>
-                Log out
+
+              <StudentPinAuth
+                selectedName={studentName}
+                pinRegistered={studentPinRegistered}
+                authBusy={authBusy}
+                isAuthed={studentAuthed}
+                onLogin={(pin) => studentLoginWithPin(studentName, pin)}
+                onRegister={(p1, p2) => studentRegisterWithPin(studentName, p1, p2)}
+              />
+            </div>
+
+            <div style={{ marginTop: 12 }}>
+              <button style={styles.tinyAdminBtn} onClick={() => setAdminMode((v) => !v)}>
+                {adminMode ? "Hide Admin" : "Admin"}
               </button>
             </div>
-          )}
-        </div>
 
-        {/* Understanding Check */}
-        <div style={styles.card}>
-          <div style={styles.sectionTitle}>Understanding Check</div>
+            {adminMode && (
+              <div style={styles.card}>
+                <div style={styles.sectionTitle}>Administrator</div>
 
-          {!logViewerAuthed ? (
-            gatedMessage
-          ) : (
-            <>
-              <div style={{ opacity: 0.85, marginBottom: 12 }}>
-                Tap a color (you can tap anytime after login).
+                {!adminAuthed ? (
+                  <div style={styles.pinBox}>
+                    <div style={styles.pinTitle}>Enter your 4-digit PIN, Administrator.</div>
+
+                    <input
+                      style={styles.pinInput}
+                      value={adminGatePin}
+                      onChange={(e) => setAdminGatePin(e.target.value.replace(/\D/g, "").slice(0, 4))}
+                      placeholder="PIN"
+                      inputMode="numeric"
+                      maxLength={4}
+                      type={showAdminPin ? "text" : "password"}
+                    />
+
+                    <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+                      <button style={styles.smallBtn} onClick={() => setShowAdminPin((v) => !v)}>
+                        {showAdminPin ? "Hide" : "Show"}
+                      </button>
+                      <button style={styles.btnGreen} onClick={adminLogin}>
+                        Login as Admin
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ marginTop: 12, textAlign: "center" }}>
+                    <div style={{ color: "#9ae6b4", fontWeight: 900, fontSize: 18 }}>
+                      Admin logged in
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </>
+        )}
+
+        {/* MAIN (after login) */}
+        {isLoggedIn && (
+          <>
+            <div style={styles.topMiniBar}>
+              <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                <button style={styles.smallBtn} onClick={() => setCalendarOpen(true)}>
+                  Date: {selectedDateKey} ▼
+                </button>
+                <select
+                  style={{ ...styles.select, width: 180, padding: "10px 10px", fontSize: 14 }}
+                  value={selectedCourse}
+                  onChange={(e) => setSelectedCourse(e.target.value)}
+                >
+                  {COURSES.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.label}
+                    </option>
+                  ))}
+                </select>
+
+                {studentAuthed && (
+                  <button style={styles.smallBtn} onClick={logoutStudent}>
+                    Log out (Student)
+                  </button>
+                )}
+                {adminAuthed && (
+                  <button style={styles.smallBtn} onClick={logoutAdmin}>
+                    Log out (Admin)
+                  </button>
+                )}
+
+                <button style={styles.tinyAdminBtn} onClick={() => setAdminMode((v) => !v)}>
+                  {adminMode ? "Hide Admin" : "Admin"}
+                </button>
               </div>
 
-              <TrafficLight
+              {calendarOpen && (
+                <Calendar2026
+                  valueDateKey={selectedDateKey}
+                  onPick={(dk) => {
+                    setSelectedDateKey(dk);
+                    setCalendarOpen(false);
+                  }}
+                  onClose={() => setCalendarOpen(false)}
+                />
+              )}
+
+              {isFutureDate && (
+                <div style={{ marginTop: 10, color: "#fbbf24", fontWeight: 900 }}>
+                  Future date selected. Submissions are disabled.
+                </div>
+              )}
+            </div>
+
+            {/* Understanding */}
+            <div style={styles.card}>
+              <div style={styles.sectionTitle}>Understanding Check</div>
+
+              <TrafficLightRow
                 disabled={!authReady || (!studentCanSubmit && !adminCanSubmit)}
                 onTap={submitUnderstanding}
               />
 
               <div style={styles.summaryRow}>
-                <div style={styles.summaryBox}>
-                  RED {ucCounts.red} <span style={{ opacity: 0.75 }}>({ucRate.red}%)</span>
-                </div>
-                <div style={styles.summaryBox}>
-                  YELLOW {ucCounts.yellow} <span style={{ opacity: 0.75 }}>({ucRate.yellow}%)</span>
-                </div>
-                <div style={styles.summaryBox}>
-                  GREEN {ucCounts.green} <span style={{ opacity: 0.75 }}>({ucRate.green}%)</span>
-                </div>
+                <div style={styles.summaryBox}>😟 RED {ucCounts.red}</div>
+                <div style={styles.summaryBox}>🤔 YELLOW {ucCounts.yellow}</div>
+                <div style={styles.summaryBox}>✅ GREEN {ucCounts.green}</div>
+                <div style={styles.summaryBox}>TOTAL {ucTotal}</div>
               </div>
 
               {/* Admin-only controls */}
               {adminAuthed && (
-                <div style={{ marginTop: 14, textAlign: "left" }}>
-                  <div style={{ fontWeight: 900, marginBottom: 10 }}>Admin View Controls</div>
+                <div style={{ marginTop: 16, textAlign: "left" }}>
+                  <div style={{ fontWeight: 900, marginBottom: 10 }}>Admin Controls</div>
 
                   <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                    <button style={{ ...styles.smallBtn }} onClick={() => setHideNames((v) => !v)}>
+                    <button style={styles.smallBtn} onClick={() => setHideNames((v) => !v)}>
                       {hideNames ? "Show Student Names" : "Hide Student Names"}
                     </button>
 
                     <button
-                      style={{ ...styles.smallBtn }}
+                      style={styles.smallBtn}
                       onClick={() => setShowUnderstandingLog((v) => !v)}
                     >
-                      {showUnderstandingLog ? "Hide Tap Log" : "Show Tap Log (with time)"}
+                      {showUnderstandingLog ? "Hide Tap History" : "Show Tap History"}
                     </button>
                   </div>
 
-                  {/* Per-student totals */}
-                  <div style={{ marginTop: 14, fontWeight: 900 }}>Per-student totals</div>
-                  {Object.keys(perStudentCounts).length === 0 ? (
-                    <div style={{ opacity: 0.8, marginTop: 6 }}>No taps yet for this date.</div>
+                  {/* (5) Session window */}
+                  <div style={{ marginTop: 14, fontWeight: 900 }}>Class Session Window (PT)</div>
+                  <div style={{ marginTop: 6, opacity: 0.9 }}>
+                    Start: <b>{sessionStart != null ? minsToLabel(sessionStart) : "—"}</b> · End:{" "}
+                    <b>{sessionEnd != null ? minsToLabel(sessionEnd) : "—"}</b>
+                  </div>
+                  <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 10 }}>
+                    <button style={styles.smallBtn} onClick={setSessionStartNow}>
+                      Start Session Now
+                    </button>
+                    <button style={styles.smallBtn} onClick={setSessionEndNow}>
+                      End Session Now
+                    </button>
+                    <button style={styles.smallBtn} onClick={clearSessionWindow}>
+                      Clear Window
+                    </button>
+                  </div>
+
+                  <div style={{ marginTop: 14, fontWeight: 900 }}>
+                    Students who did NOT tap (for {selectedDateKey})
+                  </div>
+                  {missingStudents.length === 0 ? (
+                    <div style={{ opacity: 0.85, marginTop: 6 }}>Everyone tapped ✅</div>
                   ) : (
-                    <div style={{ display: "grid", gap: 8, marginTop: 8 }}>
-                      {Object.entries(perStudentCounts).map(([name, c]) => (
-                        <div key={name} style={styles.perStudentRow}>
-                          <div style={{ fontWeight: 900 }}>{displayActor(name, "student")}</div>
-                          <div style={{ opacity: 0.95 }}>
-                            RED {c.red} · YELLOW {c.yellow} · GREEN {c.green}
-                          </div>
+                    <div style={{ marginTop: 8, display: "grid", gap: 6 }}>
+                      {missingStudents.map((n) => (
+                        <div key={n} style={styles.logItem}>
+                          {n}
                         </div>
                       ))}
                     </div>
                   )}
 
-                  {/* Tap log with timestamps */}
+                  {/* (1) Tap history + (5) Out-of-class */}
                   {showUnderstandingLog && (
                     <div style={{ marginTop: 14 }}>
-                      <div style={{ fontWeight: 900, marginBottom: 8 }}>Tap Log (PT time)</div>
-                      {ucTaps.length === 0 ? (
-                        <div style={{ opacity: 0.8 }}>No taps yet.</div>
+                      <div style={{ fontWeight: 900, marginBottom: 8 }}>Tap History (changes)</div>
+
+                      {ucEvents.length === 0 ? (
+                        <div style={{ opacity: 0.8 }}>No history yet.</div>
                       ) : (
                         <div style={{ display: "grid", gap: 8 }}>
-                          {ucTaps.map((t) => (
-                            <div key={t.id} style={styles.logItem}>
+                          {ucEvents.map((e) => (
+                            <div key={e.id} style={styles.logItem}>
                               <div style={{ fontWeight: 900 }}>
-                                {displayActor(t.actor, t.role)} · {String(t.color).toUpperCase()}
+                                {displayActor(e.actor, e.role)} · {String(e.fromColor || "—")} →{" "}
+                                {String(e.toColor || "—")}
                               </div>
                               <div style={{ opacity: 0.85, marginTop: 4 }}>
-                                {formatTsPT(t.createdAt)} (PT)
+                                {formatTsPT(e.at)} (PT)
+                                {hasSessionWindow && isOutOfClass(e.at) ? " · Out-of-class" : ""}
                               </div>
                             </div>
                           ))}
+                        </div>
+                      )}
+
+                      {hasSessionWindow && (outOfClassUCEvents.length > 0 || outOfClassPosts.length > 0) && (
+                        <div style={{ marginTop: 16 }}>
+                          <div style={{ fontWeight: 900, marginBottom: 8 }}>
+                            Out-of-class Activity (outside session window)
+                          </div>
+
+                          {outOfClassUCEvents.length > 0 && (
+                            <div style={{ marginBottom: 10 }}>
+                              <div style={{ fontWeight: 900, marginBottom: 6 }}>Understanding taps</div>
+                              <div style={{ display: "grid", gap: 8 }}>
+                                {outOfClassUCEvents.map((e) => (
+                                  <div key={e.id} style={styles.replyItem}>
+                                    <div style={{ fontWeight: 900 }}>
+                                      {displayActor(e.actor, e.role)} · {String(e.fromColor || "—")} →{" "}
+                                      {String(e.toColor || "—")}
+                                    </div>
+                                    <div style={{ opacity: 0.85, marginTop: 4 }}>
+                                      {formatTsPT(e.at)} (PT)
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+
+                          {outOfClassPosts.length > 0 && (
+                            <div>
+                              <div style={{ fontWeight: 900, marginBottom: 6 }}>Posts</div>
+                              <div style={{ display: "grid", gap: 8 }}>
+                                {outOfClassPosts.map((q) => (
+                                  <div key={q.id} style={styles.replyItem}>
+                                    <div style={{ fontWeight: 900 }}>
+                                      {displayActor(q.actor, q.role)}
+                                    </div>
+                                    <div style={{ opacity: 0.85, marginTop: 4 }}>
+                                      {formatTsPT(q.createdAt)} (PT)
+                                    </div>
+                                    <div style={{ marginTop: 8, whiteSpace: "pre-wrap" }}>{q.text}</div>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
                   )}
                 </div>
               )}
-            </>
-          )}
-        </div>
+            </div>
 
-        {/* Questions */}
-        <div style={styles.card}>
-          <div style={styles.sectionTitle}>Questions</div>
+            {/* Questions */}
+            <div style={styles.card}>
+              <div style={styles.sectionTitle}>Questions</div>
 
-          {!logViewerAuthed ? (
-            gatedMessage
-          ) : (
-            <>
               <textarea
                 style={styles.textarea}
                 placeholder={
                   !authReady
                     ? "Connecting to Firebase..."
+                    : isFutureDate
+                    ? "Future class date: posting disabled."
                     : studentCanSubmit || adminCanSubmit
                     ? "Post a question/comment..."
                     : "Login required to post."
@@ -1172,23 +1437,54 @@ export default function App() {
                 {threads.roots.map((q) => {
                   const replies = threads.repliesByParent[q.id] || [];
                   const isStudentPost = q.role === "student";
+                  const isMine = studentAuthed && q.role === "student" && q.actor === studentName;
 
                   return (
                     <div key={q.id} style={styles.logThread}>
                       <div style={styles.logItem}>
                         <div style={{ fontWeight: 900 }}>
-                          {/* role label */}
-                          {q.role === "admin" ? (adminAuthed ? "Admin" : "Professor") : "Student"} ·{" "}
-                          <span style={{ opacity: 0.92 }}>{displayActor(q.actor, q.role)}</span>
+                          {displayActor(q.actor, q.role)}
+                          {q.editedAt ? <span style={{ opacity: 0.7, marginLeft: 8 }}>(edited)</span> : null}
                         </div>
 
                         <div style={{ opacity: 0.85, marginTop: 4 }}>
                           {formatTsPT(q.createdAt)} (PT)
                         </div>
 
-                        <div style={{ marginTop: 8, whiteSpace: "pre-wrap" }}>{q.text}</div>
+                        {/* (2) Edit mode */}
+                        {editTargetId === q.id ? (
+                          <>
+                            <textarea
+                              style={{ ...styles.textarea, marginTop: 10 }}
+                              value={editText}
+                              onChange={(e) => setEditText(e.target.value)}
+                            />
+                            <div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 10 }}>
+                              <button style={styles.btnGreen} onClick={saveEdit}>
+                                Save
+                              </button>
+                              <button style={styles.smallBtn2} onClick={cancelEdit}>
+                                Cancel
+                              </button>
+                            </div>
+                          </>
+                        ) : (
+                          <div style={{ marginTop: 8, whiteSpace: "pre-wrap" }}>{q.text}</div>
+                        )}
 
-                        {/* ✅ admin reply icon/button */}
+                        {/* Student edit/delete buttons */}
+                        {isMine && editTargetId !== q.id && (
+                          <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap" }}>
+                            <button style={styles.smallBtn} onClick={() => beginEdit(q)}>
+                              Edit
+                            </button>
+                            <button style={styles.smallBtn} onClick={() => deleteMyPost(q)}>
+                              Delete
+                            </button>
+                          </div>
+                        )}
+
+                        {/* Admin reply */}
                         {adminAuthed && isStudentPost && (
                           <div style={{ marginTop: 10 }}>
                             <button
@@ -1197,7 +1493,6 @@ export default function App() {
                                 setReplyTarget({ id: q.id, actor: q.actor || "" });
                                 setAdminReplyText("");
                               }}
-                              title="Reply to this student post"
                             >
                               Reply
                             </button>
@@ -1209,10 +1504,7 @@ export default function App() {
                         <div style={styles.replyWrap}>
                           {replies.map((r) => (
                             <div key={r.id} style={styles.replyItem}>
-                              <div style={{ fontWeight: 900 }}>
-                                {adminAuthed ? "Admin" : "Professor"} ·{" "}
-                                <span style={{ opacity: 0.92 }}>{displayActor(r.actor, r.role)}</span>
-                              </div>
+                              <div style={{ fontWeight: 900 }}>{displayActor(r.actor, r.role)}</div>
                               <div style={{ opacity: 0.85, marginTop: 4 }}>
                                 {formatTsPT(r.createdAt)} (PT)
                               </div>
@@ -1226,7 +1518,7 @@ export default function App() {
                 })}
               </div>
 
-              {/* ✅ reply composer */}
+              {/* Admin reply composer */}
               {adminAuthed && replyTarget?.id && (
                 <div style={{ marginTop: 16, textAlign: "left" }}>
                   <div style={{ fontWeight: 900, marginBottom: 8 }}>
@@ -1241,14 +1533,15 @@ export default function App() {
                     placeholder="Write your reply..."
                     value={adminReplyText}
                     onChange={(e) => setAdminReplyText(e.target.value)}
+                    disabled={!adminCanSubmit}
                   />
 
                   <div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 10 }}>
-                    <button style={styles.btnGreen} onClick={submitAdminReply}>
+                    <button style={{ ...styles.btnGreen, ...(adminCanSubmit ? {} : styles.btnDisabled) }} onClick={submitAdminReply} disabled={!adminCanSubmit}>
                       Post Reply
                     </button>
                     <button
-                      style={{ ...styles.smallBtn2 }}
+                      style={styles.smallBtn2}
                       onClick={() => {
                         setReplyTarget(null);
                         setAdminReplyText("");
@@ -1259,79 +1552,44 @@ export default function App() {
                   </div>
                 </div>
               )}
-            </>
-          )}
-        </div>
+            </div>
 
-        {/* Admin panel */}
-        {adminMode && (
-          <div style={styles.card}>
-            <div style={styles.sectionTitle}>Administrator</div>
-
-            {!adminAuthed ? (
-              <div style={styles.pinBox}>
-                <div style={styles.pinTitle}>Enter your 4-digit PIN, Administrator.</div>
-
-                {/* ✅ 요청 #5: PIN 노출 방지 */}
-                <input
-                  style={styles.pinInput}
-                  value={adminGatePin}
-                  onChange={(e) => setAdminGatePin(e.target.value.replace(/\D/g, "").slice(0, 4))}
-                  placeholder="PIN"
-                  inputMode="numeric"
-                  maxLength={4}
-                  type="password"
-                  autoComplete="off"
-                />
-
-                <button style={styles.btnGreen} onClick={adminLogin}>
-                  Login as Admin
-                </button>
-
-                <div style={{ marginTop: 10, opacity: 0.75, fontSize: 12 }}>
-                  (This admin box is professor-only. Students should not use it.)
-                </div>
-              </div>
-            ) : (
-              <div style={{ marginTop: 12 }}>
-                <div
-                  style={{
-                    textAlign: "center",
-                    color: "#9ae6b4",
-                    fontWeight: 900,
-                    fontSize: 18,
-                  }}
-                >
-                  Admin logged in
-                </div>
-
-                <div style={{ display: "flex", justifyContent: "center" }}>
-                  <button style={styles.smallBtn2} onClick={logoutAdmin}>
-                    Log out
-                  </button>
-                </div>
-
-                <div style={{ marginTop: 14, opacity: 0.8, fontSize: 12 }}>
-                  Tip: Turn ON “Hide Student Names” before projecting.
-                </div>
+            {/* Admin panel toggle */}
+            {adminMode && (
+              <div style={styles.card}>
+                <div style={styles.sectionTitle}>Administrator</div>
+                {!adminAuthed ? (
+                  <div style={styles.pinBox}>
+                    <div style={styles.pinTitle}>Enter your 4-digit PIN, Administrator.</div>
+                    <input
+                      style={styles.pinInput}
+                      value={adminGatePin}
+                      onChange={(e) => setAdminGatePin(e.target.value.replace(/\D/g, "").slice(0, 4))}
+                      placeholder="PIN"
+                      inputMode="numeric"
+                      maxLength={4}
+                      type={showAdminPin ? "text" : "password"}
+                    />
+                    <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+                      <button style={styles.smallBtn} onClick={() => setShowAdminPin((v) => !v)}>
+                        {showAdminPin ? "Hide" : "Show"}
+                      </button>
+                      <button style={styles.btnGreen} onClick={adminLogin}>
+                        Login as Admin
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ marginTop: 12, textAlign: "center" }}>
+                    <div style={{ color: "#9ae6b4", fontWeight: 900, fontSize: 18 }}>
+                      Admin logged in
+                    </div>
+                  </div>
+                )}
               </div>
             )}
-          </div>
+          </>
         )}
-
-        {/* Footer */}
-        <div style={{ opacity: 0.65, marginTop: 12, fontSize: 12 }}>App ID: {APP_ID}</div>
-
-        {/* tiny admin toggle */}
-        <div style={{ marginTop: 12 }}>
-          <button
-            style={styles.tinyAdminBtn}
-            onClick={() => setAdminMode((v) => !v)}
-            title="Professor-only admin toggle"
-          >
-            {adminMode ? "Hide Admin" : "Admin"}
-          </button>
-        </div>
       </div>
     </div>
   );
@@ -1352,13 +1610,17 @@ const styles = {
     fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial",
   },
   container: { width: "min(880px, 100%)" },
-  title: { fontSize: 34, fontWeight: 900, marginTop: 10 },
-  subtitle: {
-    marginTop: 8,
-    marginBottom: 18,
-    fontSize: 18,
-    fontWeight: 800,
-    color: "#ff7a18",
+
+  // (3) Title colors/sizes
+  titleOrange: { fontSize: 36, fontWeight: 900, marginTop: 10, color: "#ff7a18" },
+  subtitleGreen: { marginTop: 10, marginBottom: 18, fontSize: 26, fontWeight: 900, color: "#22c55e" },
+
+  topMiniBar: {
+    background: "rgba(255,255,255,0.03)",
+    border: "1px solid rgba(255,255,255,0.08)",
+    borderRadius: 14,
+    padding: 12,
+    marginTop: 10,
   },
   card: {
     background: "#0f1b2e",
@@ -1472,6 +1734,36 @@ const styles = {
     fontWeight: 900,
     display: "inline-block",
   },
+
+  trafficRow: {
+    display: "flex",
+    justifyContent: "center",
+    gap: 14,
+    alignItems: "center",
+    flexWrap: "wrap",
+    marginTop: 8,
+  },
+  trafficBtn: {
+    border: "none",
+    background: "transparent",
+    cursor: "pointer",
+    padding: 0,
+    display: "grid",
+    justifyItems: "center",
+    gap: 8,
+    minWidth: 110,
+  },
+  trafficCircle: {
+    width: 64,
+    height: 64,
+    borderRadius: "999px",
+    boxShadow: "inset 0 0 0 5px rgba(255,255,255,0.15), 0 8px 20px rgba(0,0,0,0.35)",
+    display: "grid",
+    placeItems: "center",
+  },
+  trafficEmoji: { fontSize: 26, filter: "drop-shadow(0 2px 6px rgba(0,0,0,0.35))" },
+  trafficLabel: { fontWeight: 900, opacity: 0.95 },
+
   logThread: { marginBottom: 10 },
   logItem: {
     padding: 12,
@@ -1493,15 +1785,6 @@ const styles = {
     background: "rgba(22,163,74,0.08)",
     border: "1px solid rgba(255,255,255,0.08)",
   },
-  perStudentRow: {
-    padding: 10,
-    borderRadius: 12,
-    background: "rgba(255,255,255,0.03)",
-    border: "1px solid rgba(255,255,255,0.08)",
-    display: "flex",
-    justifyContent: "space-between",
-    gap: 12,
-  },
   summaryRow: {
     marginTop: 14,
     display: "flex",
@@ -1516,32 +1799,9 @@ const styles = {
     background: "rgba(255,255,255,0.04)",
     border: "1px solid rgba(255,255,255,0.08)",
     fontWeight: 900,
-    minWidth: 160,
+    minWidth: 150,
   },
-  trafficShell: {
-    width: 110,
-    margin: "0 auto",
-    padding: 14,
-    borderRadius: 18,
-    background: "#0b1220",
-    border: "1px solid rgba(255,255,255,0.10)",
-    display: "flex",
-    flexDirection: "column",
-    gap: 12,
-    alignItems: "center",
-  },
-  lightBtn: {
-    border: "none",
-    background: "transparent",
-    cursor: "pointer",
-    padding: 0,
-  },
-  lightCircle: {
-    width: 52,
-    height: 52,
-    borderRadius: "999px",
-    boxShadow: "inset 0 0 0 5px rgba(255,255,255,0.15), 0 8px 20px rgba(0,0,0,0.35)",
-  },
+
   calendarOverlay: {
     position: "fixed",
     inset: 0,
@@ -1605,6 +1865,7 @@ const styles = {
     background: "#ff7a18",
     border: "1px solid rgba(255,255,255,0.25)",
   },
+
   tinyAdminBtn: {
     padding: "8px 10px",
     borderRadius: 12,
