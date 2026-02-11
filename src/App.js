@@ -873,6 +873,7 @@ export default function App() {
       selectedCourse,
       selectedDateKey,
       isFutureDate,
+      isPastDate,   // ✅ 추가
     ]
   );
 
