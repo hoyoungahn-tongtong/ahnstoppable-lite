@@ -445,6 +445,9 @@ export default function App() {
   // ============================
   const todayPTKey = getPacificDateKeyNow();
   const isFutureDate = selectedDateKey > todayPTKey;
+  const isPastDate = selectedDateKey < todayPTKey;
+
+  
 
   // ============================================
   // 1) Auth Ready init
@@ -631,6 +634,8 @@ export default function App() {
   // 제출 가능 조건 (4번: 미래 날짜는 제출 불가)
   const studentCanSubmit = studentAuthed && !isFutureDate;
   const adminCanSubmit = adminAuthed && !isFutureDate;
+  const studentCanSubmitUC = studentAuthed && !isFutureDate && !isPastDate; // ✅ 과거 불가
+
 
   // ============================================
   // 7) Class session window doc (Admin만 구독)
@@ -810,6 +815,10 @@ export default function App() {
       if (!logViewerAuthed) return alert("Please login first.");
       if (!authReady) return;
       if (isFutureDate) return alert("Future class dates: submissions are disabled.");
+      // ✅ 학생은 과거 날짜에 UC 제출 금지
+      if (!adminCanSubmit && isPastDate) {
+      return alert("Past dates are locked for Understanding Check.");
+      }
 
       const actor = adminCanSubmit ? ADMIN_NAME : studentName;
       const role = adminCanSubmit ? "admin" : "student";
@@ -1255,8 +1264,9 @@ export default function App() {
             <div style={styles.card}>
               <div style={styles.sectionTitle}>Understanding Check</div>
 
-              <TrafficLightRow
-                disabled={!authReady || (!studentCanSubmit && !adminCanSubmit)}
+          
+              <TrafficLightRow 
+                disabled={!authReady || (!studentCanSubmitUC && !adminCanSubmit)}
                 onTap={submitUnderstanding}
               />
 
